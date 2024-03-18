@@ -8,34 +8,52 @@ use AbuseIPDB\Exceptions\PaymentRequiredException;
 use AbuseIPDB\Exceptions\TooManyRequestsException;
 use AbuseIPDB\Exceptions\UnconventionalErrorException;
 use AbuseIPDB\Exceptions\UnprocessableContentException;
+use AbuseIPDB\ResponseObjects\BlacklistPlaintextResponse;
+use AbuseIPDB\ResponseObjects\BlacklistResponse;
+use AbuseIPDB\ResponseObjects\BulkReportResponse;
+use AbuseIPDB\ResponseObjects\CheckBlockResponse;
+use AbuseIPDB\ResponseObjects\CheckResponse;
+use AbuseIPDB\ResponseObjects\ClearAddressResponse;
+use AbuseIPDB\ResponseObjects\ReportResponse;
+use AbuseIPDB\ResponseObjects\ReportsPaginatedResponse;
+use BadMethodCallException;
 use DateTime;
+use DateTimeInterface;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
+use Illuminate\Http\Response as HttpResponse;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Traits\ForwardsCalls;
 
 class AbuseIPDBLaravel
 {
+    use ForwardsCalls;
+
     /**
-     * API endpoints available with their respective HTTP request verbs
+     * Methods available and HTTP request verbs
      *
      * @var array
      */
-    public const ENDPOINTS = [
-        'check' => 'get',
-        'reports' => 'get',
-        'blacklist' => 'get',
-        'report' => 'post',
-        'check-block' => 'get',
-        'bulk-report' => 'post',
-        'clear-address' => 'delete',
+    private array $methods = [
+        'get',
+        'post',
+        'delete',
+        'check',
+        'checkBlock',
+        'clearAddress',
+        'blacklist',
+        'blacklistPlainText',
+        'bulkReport',
+        'report',
+        'reports',
     ];
 
     /**
      * Attacks categories available with their respective identifier
      *
-     * @var array
+     * @var array<string>
      */
-    public const CATEGORIES = [
+    private array $categories = [
         'DNS_Compromise' => 1,
         'DNS_Poisoning' => 2,
         'Fraud_Orders' => 3,
@@ -62,270 +80,288 @@ class AbuseIPDBLaravel
     ];
 
     /**
-     * The "client" to make requests with
-     *
-     * @var PendingRequest
-     */
-    private $client;
-
-    /**
-     * Lazy loads client and sets base url
-     *
      * @throws MissingAPIKeyException
      */
-    private function lazyLoadSetup()
+    public function __construct(private PendingRequest $request)
     {
-        if (! config('abuseipdb.api_key')) {
+        if (!config('abuseipdb.api_key')) {
             throw new MissingAPIKeyException('ABUSEIPDB_API_KEY must be set in .env with an AbuseIPBD API key.');
         }
 
-        $this->client = Http::withHeaders([
-            'X-Request-Source' => 'Laravel_'.app()->version().';Laravel_'.config('abuseipdb.version').';',
-            'Key' => config('abuseipdb.api_key'),
-        ])->withOptions([
-            'verify' => ! app()->islocal(),
-        ])->baseUrl(config('abuseipdb.base_url'));
+        $this->request = Http::baseUrl(config('abuseipdb.base_url'))
+            ->withHeaders([
+                'X-Request-Source' => 'Laravel_' . app()->version() . ';Laravel_' . config('abuseipdb.version') . ';',
+                'Key' => config('abuseipdb.api_key'),
+            ]);
     }
 
     /**
-     * Function that all requests will be passed through
-     *
-     * @throws UnprocessableContentException
-     * @throws TooManyRequestsException
+     * @param string $method
+     * @param array $parameters
+     * @return Response
      * @throws PaymentRequiredException
+     * @throws TooManyRequestsException
      * @throws UnconventionalErrorException
+     * @throws UnprocessableContentException
      */
-    private function makeRequest($endpointName, $parameters, $acceptType = 'application/json', string $fileContents = null): ?Response
+    public function __call(string $method, array $parameters): Response
     {
-        if (! $this->client) {
-            $this->lazyLoadSetup();
+        if (!in_array($method, $this->methods)) {
+            throw new BadMethodCallException(sprintf(
+                'Call to undefined method %s::%s()', static::class, $method
+            ));
         }
 
-        $requestMethod = self::ENDPOINTS[$endpointName];
-
-        $this->client->withHeader('Accept', $acceptType);
-
-        if ($fileContents) {
-            $this->client->attach('csv', $fileContents, 'report.csv');
-        }
-
-        /**
-         * @var Response
-         */
-        $response = $this->client->$requestMethod($endpointName, $parameters);
+        $response = $this->forwardCallTo($this->request, $method, $parameters);
 
         $status = $response->status();
 
-        if ($status === 200) {
-            return $response;
+        if ($status !== HttpResponse::HTTP_OK) {
+            $message = 'AbuseIPDB: ' . $response->object()->errors[0]->detail;
+
+            match ($status) {
+                HttpResponse::HTTP_TOO_MANY_REQUESTS => throw new TooManyRequestsException($message),
+                HttpResponse::HTTP_PAYMENT_REQUIRED => throw new PaymentRequiredException($message),
+                HttpResponse::HTTP_UNPROCESSABLE_ENTITY => throw new UnprocessableContentException($message),
+                default => throw new UnconventionalErrorException($message),
+            };
         }
 
-        $message = 'AbuseIPDB: '.$response->object()->errors[0]->detail;
-
-        match ($status) {
-            429 => throw new Exceptions\TooManyRequestsException($message),
-            402 => throw new Exceptions\PaymentRequiredException($message),
-            422 => throw new Exceptions\UnprocessableContentException($message),
-            default => throw new Exceptions\UnconventionalErrorException($message),
-        };
+        return $response;
     }
 
     /**
      * Checks an IP address against the AbuseIPDB database
      *
      * @param string $ipAddress The IP address to check
-     * @param int $maxAgeInDays The maximum age of reports to return
+     * @param int $maxAgeInDays The maximum age in days of reports to return
      * @param bool $verbose Whether to include verbose information (reports)
      * @throws InvalidParameterException
      */
-    public function check(string $ipAddress, int $maxAgeInDays = 30, bool $verbose = false): ResponseObjects\CheckResponse
+    public function check(string $ipAddress, int $maxAgeInDays = 30, bool $verbose = false): CheckResponse
+    {
+        if (!filter_var($ipAddress, FILTER_VALIDATE_IP)) {
+            throw InvalidParameterException::invalidIpAddress($ipAddress);
+        }
+
+        if ($maxAgeInDays < 1 || $maxAgeInDays > 365) {
+            throw InvalidParameterException::maxAgeInDaysOutOfRange($maxAgeInDays);
+        }
+
+        $checkResponse = $this->request->get('check', [
+            'ipAddress' => $ipAddress,
+            'maxAgeInDays' => $maxAgeInDays,
+            'verbose' => $verbose,
+        ]);
+
+        return new CheckResponse($checkResponse);
+    }
+
+    /**
+     * Checks an entire subnet against the AbuseIPDB database
+     *
+     * @param string $network The network to check in CIDR notation (e.g. 127.0.0.1/28)
+     * @param int $maxAgeInDays The maximum age in days of reports to return
+     * @throws InvalidParameterException
+     */
+    public function checkBlock(string $network, int $maxAgeInDays = 30): CheckBlockResponse
     {
         if ($maxAgeInDays < 1 || $maxAgeInDays > 365) {
-            throw new Exceptions\InvalidParameterException('maxAgeInDays must be between 1 and 365.');
+            throw InvalidParameterException::maxAgeInDaysOutOfRange($maxAgeInDays);
         }
 
-        $parameters = [];
-        $parameters['ipAddress'] = $ipAddress;
-        $parameters['maxAgeInDays'] = $maxAgeInDays;
-        if ($verbose) {
-            $parameters['verbose'] = $verbose;
+        $checkBlockResponse = $this->request->get('check-block', [
+            'network' => $network,
+            'maxAgeInDays' => $maxAgeInDays,
+        ]);
+
+        return new CheckBlockResponse($checkBlockResponse);
+    }
+
+    /**
+     * Remove your reports for an IP address from the AbuseIPDB database.
+     *
+     * @param string $ipAddress The IP address to clear reports for
+     * @throws InvalidParameterException
+     */
+    public function clearAddress(string $ipAddress): ClearAddressResponse
+    {
+        if (!filter_var($ipAddress, FILTER_VALIDATE_IP)) {
+            throw InvalidParameterException::invalidIpAddress($ipAddress);
         }
 
-        $httpResponse = $this->makeRequest('check', $parameters);
+        $clearAddressResponse = $this->request->delete('clear-address', [
+            'ipAddress' => $ipAddress,
+        ]);
 
-        return new ResponseObjects\CheckResponse($httpResponse);
+        return new ClearAddressResponse($clearAddressResponse);
+    }
+
+    /**
+     * Gets the AbuseIPDB blacklist
+     *
+     * @param int $confidenceMinimum The minimum confidence score to include an IP in the blacklist.
+     * @param int $limit The maximum amount blacklisted IPs to return.
+     * @param array $onlyCountries Only include IPs from these countries (use 2-letter country codes).
+     * @param array $exceptCountries Exclude IPs from these countries (use 2-letter country codes).
+     * @param int|null $ipVersion The IP version to return (4 or 6), defaults to both.
+     * @throws InvalidParameterException
+     */
+    public function blacklist(int $confidenceMinimum = 100, int $limit = 10000, array $onlyCountries = [], array $exceptCountries = [], int $ipVersion = null): ResponseObjects\BlacklistResponse|ResponseObjects\BlacklistPlaintextResponse
+    {
+        if ($confidenceMinimum < 25 || $confidenceMinimum > 100) {
+            throw InvalidParameterException::minimumConfidenceOutOfRange($confidenceMinimum);
+        }
+
+        $invalidOnlyCountries = array_filter($onlyCountries, fn($countryCode) => !strlen($countryCode) == 2);
+        $invalidExceptCountries = array_filter($exceptCountries, fn($countryCode) => !strlen($countryCode) == 2);
+
+        if ($invalidOnlyCountries) {
+            throw InvalidParameterException::invalidOnlyCountriesCode($invalidOnlyCountries);
+        }
+
+        if ($invalidExceptCountries) {
+            throw InvalidParameterException::invalidExceptCountriesCode($invalidExceptCountries);
+        }
+
+        if (!in_array($ipVersion, [4, 6])) {
+            throw InvalidParameterException::invalidIpVersion($ipVersion);
+        }
+
+        $blacklistResponse = $this->request->get('blacklist', [
+            'confidenceMinimum' => $confidenceMinimum,
+            'limit' => $limit,
+            'onlyCountries' => $onlyCountries,
+            'exceptCountries' => $exceptCountries,
+            'ipVersion' => $ipVersion,
+        ]);
+
+        return new BlacklistResponse($blacklistResponse);
+    }
+
+    /**
+     * Gets the AbuseIPDB blacklist in a plaintext (a plain array of IPs)
+     *
+     * @param int $confidenceMinimum The minimum confidence score to include an IP in the blacklist.
+     * @param int $limit The maximum amount blacklisted IPs to return
+     * @param array $onlyCountries Only include IPs from these countries (use 2-letter country codes)
+     * @param array $exceptCountries Exclude IPs from these countries (use 2-letter country codes)
+     * @param int|null $ipVersion The IP version to return (4 or 6), defaults to both.
+     * @throws InvalidParameterException
+     */
+    public function blacklistPlainText(int $confidenceMinimum = 100, int $limit = 10000, array $onlyCountries = [], array $exceptCountries = [], int $ipVersion = null): BlacklistPlaintextResponse
+    {
+        if ($confidenceMinimum < 25 || $confidenceMinimum > 100) {
+            throw InvalidParameterException::minimumConfidenceOutOfRange($confidenceMinimum);
+        }
+
+        $invalidOnlyCountries = array_filter($onlyCountries, fn($countryCode) => !strlen($countryCode) == 2);
+        $invalidExceptCountries = array_filter($exceptCountries, fn($countryCode) => !strlen($countryCode) == 2);
+
+        if ($invalidOnlyCountries) {
+            throw InvalidParameterException::invalidOnlyCountriesCode($invalidOnlyCountries);
+        }
+
+        if ($invalidExceptCountries) {
+            throw InvalidParameterException::invalidExceptCountriesCode($invalidExceptCountries);
+        }
+
+        if (!in_array($ipVersion, [4, 6])) {
+            throw InvalidParameterException::invalidIpVersion($ipVersion);
+        }
+
+        $blacklistPlainTextResponse = $this->request
+            ->accept('text/plain')
+            ->get('blacklist', [
+                'confidenceMinimum' => $confidenceMinimum,
+                'limit' => $limit,
+                'onlyCountries' => $onlyCountries,
+                'exceptCountries' => $exceptCountries,
+                'ipVersion' => $ipVersion,
+            ]);
+
+        return new BlacklistPlaintextResponse($blacklistPlainTextResponse);
+    }
+
+    /**
+     * Reports multiple IP addresses to AbuseIPDB in bulk from a csv.
+     *
+     * @param string $csvFileContents The contents of the csv file to upload
+     */
+    public function bulkReport(string $csvFileContents): BulkReportResponse
+    {
+        $bulkReportResponse = $this->request
+            ->attach('csv', $csvFileContents, 'report.csv')
+            ->post('bulk-report');
+
+        return new BulkReportResponse($bulkReportResponse);
     }
 
     /**
      * Reports an IP address to AbuseIPDB
      *
-     * @param string $ip The IP address to report
-     * @param array|int $categories The categories to report the IP address for
+     * @param string $ipAddress The IP address to report
+     * @param array<string>|string $categories The categories to report the IP address for
      * @param string|null $comment A comment to include with the report
      * @param DateTime|null $timestamp A timestamp to include with the report
-     * @throws \AbuseIPDB\Exceptions\InvalidParameterException
+     * @throws InvalidParameterException
      */
-    public function report(string $ip, array|int $categories, string $comment = null, DateTime $timestamp = null): ResponseObjects\ReportResponse
+    public function report(string $ipAddress, array|int $categories, string $comment = null, DateTimeInterface $timestamp = null): ReportResponse
     {
-        foreach ((array) $categories as $cat) {
-            if (! in_array($cat, self::CATEGORIES)) {
-                throw new Exceptions\InvalidParameterException('Individual category must be a valid category.');
-            }
+        if (!filter_var($ipAddress, FILTER_VALIDATE_IP)) {
+            throw InvalidParameterException::invalidIpAddress($ipAddress);
         }
 
-        $parameters = [];
-        $parameters['ip'] = $ip;
-        $parameters['categories'] = $categories;
-        if ($comment) {
-            $parameters['comment'] = $comment;
-        }
-        if ($timestamp) {
-            $parameters['timestamp'] = $timestamp->format(DateTime::ATOM);
+        if (!is_array($categories)) {
+            $categories = [$categories];
         }
 
-        $httpResponse = $this->makeRequest('report', $parameters);
+        $invalidCategories = array_diff($categories, $this->categories);
 
-        return new ResponseObjects\ReportResponse($httpResponse);
+        if (!empty($invalidCategories)) {
+            throw InvalidParameterException::invalidCategories($invalidCategories);
+        }
+
+        $reportResponse = $this->request->post('report', [
+            'ip' => $ipAddress,
+            'categories' => $categories,
+            'comment' => $comment,
+            'timestamp' => $timestamp?->format(DateTimeInterface::ATOM),
+        ]);
+
+        return new ReportResponse($reportResponse);
     }
 
     /**
-     * Get the reports for a single IP address (v4 or v6)
+     * Get the reports for a single IP address
      *
      * @param string $ipAddress The IP address to get reports for
-     * @param int $maxAgeInDays The maximum age of reports to return
+     * @param int $maxAgeInDays The maximum age in days of reports to return
      * @param int $page The page number to get
-     * @param int $perPage The number of reports to get per page
-     * @throws \AbuseIPDB\Exceptions\InvalidParameterException
+     * @param int $perPage The amount reports to get per page
+     * @throws InvalidParameterException
      */
-    public function reports(string $ipAddress, int $maxAgeInDays = 30, int $page = 1, int $perPage = 25): ResponseObjects\ReportsPaginatedResponse
+    public function reports(string $ipAddress, int $maxAgeInDays = 30, int $page = 1, int $perPage = 25): ReportsPaginatedResponse
     {
         if ($maxAgeInDays < 1 || $maxAgeInDays > 365) {
-            throw new InvalidParameterException('maxAgeInDays must be between 1 and 365.');
+            throw InvalidParameterException::maxAgeInDaysOutOfRange($maxAgeInDays);
         }
 
         if ($page < 1) {
-            throw new InvalidParameterException('page must be at least 1.');
+            throw InvalidParameterException::pageOutOfRange($page);
         }
 
         if ($perPage < 1 || $perPage > 100) {
-            throw new InvalidParameterException('perPage must be between 1 and 100.');
+            throw InvalidParameterException::perPageOutOfRange($perPage);
         }
 
-        $parameters = [];
-        $parameters['ipAddress'] = $ipAddress;
-        $parameters['maxAgeInDays'] = $maxAgeInDays;
-        $parameters['page'] = $page;
-        $parameters['perPage'] = $perPage;
+        $reportsResponse = $this->request->get('reports', [
+            'ipAddress' => $ipAddress,
+            'maxAgeInDays' => $maxAgeInDays,
+            'page' => $page,
+            'perPage' => $perPage,
+        ]);
 
-        $response = $this->makeRequest('reports', $parameters);
-
-        return new ResponseObjects\ReportsPaginatedResponse($response);
-    }
-
-    /**
-     * Gets the AbuseIPDB blacklist
-     * 
-     * @param int $confidenceMinimum The minimum confidence score to include an IP in the blacklist
-     * @param int $limit The maximum number of blacklisted IPs to return
-     * @param bool $plaintext Whether to return the blacklist in plaintext (a plain array of IPs)
-     * @param array $onlyCountries Only include IPs from these countries (use 2-letter country codes)
-     * @param array $exceptCountries Exclude IPs from these countries (use 2-letter country codes)
-     * @param int|null $ipVersion The IP version to return (4 or 6), defaults to both
-     * @throws \AbuseIPDB\Exceptions\InvalidParameterException
-     */
-    public function blacklist(int $confidenceMinimum = 100, int $limit = 10000, bool $plaintext = false, $onlyCountries = [], $exceptCountries = [], int $ipVersion = null): ResponseObjects\BlacklistResponse|ResponseObjects\BlacklistPlaintextResponse
-    {
-        if ($confidenceMinimum < 25 || $confidenceMinimum > 100) {
-            throw new InvalidParameterException('confidenceMinimum must be between 25 and 100.');
-        }
-
-        foreach ($onlyCountries as $countryCode) {
-            if (strlen($countryCode) != 2) {
-                throw new InvalidParameterException('Country codes must be 2 characters long.');
-            }
-        }
-
-        foreach ($exceptCountries as $countryCode) {
-            if (strlen($countryCode) != 2) {
-                throw new InvalidParameterException('Country codes must be 2 characters long.');
-            }
-        }
-
-        if ($ipVersion && $ipVersion != 4 && $ipVersion != 6) {
-            throw new InvalidParameterException('ipVersion must be 4 or 6.');
-        }
-
-        $parameters = [];
-        $parameters['confidenceMinimum'] = $confidenceMinimum;
-        $parameters['limit'] = $limit;
-        if ($ipVersion) {
-            $parameters['ipVersion'] = $ipVersion;
-        }
-        if ($onlyCountries) {
-            $parameters['onlyCountries'] = $onlyCountries;
-        }
-        if ($exceptCountries) {
-            $parameters['exceptCountries'] = $exceptCountries;
-        }
-
-        if ($plaintext) {
-            $parameters['plaintext'] = $plaintext;
-            $httpResponse = $this->makeRequest('blacklist', $parameters, 'text/plain');
-
-            return new ResponseObjects\BlacklistPlaintextResponse($httpResponse);
-        } else {
-            $httpResponse = $this->makeRequest('blacklist', $parameters);
-
-            return new ResponseObjects\BlacklistResponse($httpResponse);
-        }
-    }
-
-    /**
-     * Checks an entire subnet against the AbuseIPDB database
-     * 
-     * @param string $network The network to check in CIDR notation (e.g. 127.0.0.1/28)
-     * @param int $maxAgeInDays The maximum age of reports to return
-     * @throws \AbuseIPDB\Exceptions\InvalidParameterException
-     */
-    public function checkBlock(string $network, int $maxAgeInDays = 30): ResponseObjects\CheckBlockResponse
-    {
-        if ($maxAgeInDays < 1 || $maxAgeInDays > 365) {
-            throw new InvalidParameterException('maxAgeInDays must be between 1 and 365.');
-        }
-
-        $parameters = [];
-        $parameters['network'] = $network;
-        $parameters['maxAgeInDays'] = $maxAgeInDays;
-
-        $response = $this->makeRequest('check-block', $parameters);
-
-        return new ResponseObjects\CheckBlockResponse($response);
-    }
-
-    /**
-     * Reports multiple IP addresses to AbuseIPDB in bulk from a csv
-     * 
-     * @param string $csvFileContents The contents of the csv file to upload
-     */
-    public function bulkReport(string $csvFileContents): ResponseObjects\BulkReportResponse
-    {
-        $response = $this->makeRequest('bulk-report', [], fileContents: $csvFileContents);
-
-        return new ResponseObjects\BulkReportResponse($response);
-    }
-
-    /**
-     * Deletes your reports for a specific address from the AbuseIPDB database
-     * 
-     * @param string $ipAddress The IP address to clear reports for
-     */
-    public function clearAddress(string $ipAddress): ResponseObjects\ClearAddressResponse
-    {
-        $parameters = [];
-        $parameters['ipAddress'] = $ipAddress;
-
-        $response = $this->makeRequest('clear-address', $parameters);
-
-        return new ResponseObjects\ClearAddressResponse($response);
+        return new ReportsPaginatedResponse($reportsResponse);
     }
 }
